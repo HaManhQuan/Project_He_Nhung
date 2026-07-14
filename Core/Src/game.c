@@ -1,12 +1,12 @@
 /**
  * *****************************************************************************
  * @file    game.c
- * @brief   Flappy Bird cho STM32F429I-DISC1 (Toi uu VSYNC chong nhay & Am thanh TIM4)
+ * @brief   Flappy Bird cho STM32F429I-DISC1 (Phien ban tang toc DMA2D + Xoay chim)
  *
  *  - Man hinh: TFT 240x320 tich hop tren board (dieu khien qua BSP_LCD_*)
- *  - Dieu khien: nut USER (B1) tren chan PA0 -> nhan de chim bay len
- *  - Do hoa: Toi uu hoa VSYNC double-buffering bang cach doi dia chi Layer 0
- *  - Am thanh: Su dung ngat Timer 4 de dieu tan coi chip PC9 (Buzzer) + nhay LED PG14
+ *  - Dieu khien: nut USER (B1) PA0 hoac cham vao bat ky dau tren man hinh cam ung
+ *  - Do hoa: Tang toc phan cung DMA2D (Chrom-Art) de ve nen, mat dat, chim va cot
+ *  - Am thanh: Ngat Timer 4 dieu tan coi chip PC9 va nhay LED PG14
  * *****************************************************************************
  */
 #include "game.h"
@@ -121,12 +121,10 @@ static void Buzzer_Init(void)
     __HAL_RCC_TIM4_CLK_ENABLE();
 
     // 4. Cau hinh TIM4 o che do Time Base
-    // Tan so dau vao cua TIM4 la 90 MHz (APB1 Timer Clock = 90 MHz)
-    // Dat prescaler = 90 - 1 de timer tang 1 microgiay moi tick (1 MHz)
     htim4.Instance = TIM4;
     htim4.Init.Prescaler = 90 - 1;
     htim4.Init.CounterMode = TIM_COUNTERMODE_UP;
-    htim4.Init.Period = 1000 - 1; // Mac dinh ngat o 1 kHz (tao ra song vuong 500 Hz)
+    htim4.Init.Period = 1000 - 1; // Mac dinh ngat o 1 kHz
     htim4.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
     HAL_TIM_Base_Init(&htim4);
 
@@ -143,9 +141,8 @@ static void play_frequency(uint16_t freq)
         HAL_GPIO_WritePin(GPIOC, GPIO_PIN_9, GPIO_PIN_RESET);
         HAL_GPIO_WritePin(GPIOG, GPIO_PIN_14, GPIO_PIN_RESET);
     } else {
-        // Chu ky chu ky ngat = 1 MHz / (2 * Tan so)
         uint32_t period = 500000u / freq;
-        if (period < 5) period = 5; // Gioi han de tranh treo ngat neu tan so qua cao
+        if (period < 5) period = 5;
         __HAL_TIM_SET_AUTORELOAD(&htim4, period - 1);
         __HAL_TIM_SET_COUNTER(&htim4, 0);
         HAL_TIM_Base_Start_IT(&htim4);
@@ -154,7 +151,6 @@ static void play_frequency(uint16_t freq)
 
 static void start_sound(SoundEffect effect)
 {
-    // Tieng no luc va cham (HIT_DIE) duoc uu tien cao nhat, khong bi ngat khac de len
     if (g_current_sound == SOUND_HIT_DIE && effect != SOUND_HIT_DIE) {
         return;
     }
@@ -173,7 +169,6 @@ static void update_sound_effects(void)
 
     switch (g_current_sound) {
         case SOUND_WING:
-            // Tieng vo canh (Wing): Quet tan so nhanh tu 450 Hz den 900 Hz trong 80ms (4 khung hinh)
             if (g_sound_frame <= 4) {
                 uint16_t freq = 450 + (g_sound_frame - 1) * 150;
                 play_frequency(freq);
@@ -184,10 +179,6 @@ static void update_sound_effects(void)
             break;
 
         case SOUND_POINT:
-            // Tieng bíp kép (Point):
-            // Khung 1-3 (60ms): 880 Hz
-            // Khung 4-5 (40ms): lang lang
-            // Khung 6-10 (100ms): 1320 Hz
             if (g_sound_frame <= 3) {
                 play_frequency(880);
             } else if (g_sound_frame <= 5) {
@@ -201,7 +192,6 @@ static void update_sound_effects(void)
             break;
 
         case SOUND_HIT_DIE:
-            // Tieng va cham roi tu do (Hit/Die): Quet tan so tut dan tu 700 Hz ve 100 Hz trong 300ms (15 khung hinh)
             if (g_sound_frame <= 15) {
                 uint16_t freq = 700 - (g_sound_frame - 1) * 40;
                 play_frequency(freq);
@@ -218,12 +208,11 @@ static void update_sound_effects(void)
     }
 }
 
-/* Callback ngat Timer duoc goi boi HAL_TIM_IRQHandler */
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
     if (htim->Instance == TIM4) {
-        HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_9);  // Dao trang thai coi Buzzer
-        HAL_GPIO_TogglePin(GPIOG, GPIO_PIN_14); // Dao trang thai LED do dong bo voi tieng coi
+        HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_9);
+        HAL_GPIO_TogglePin(GPIOG, GPIO_PIN_14);
     }
 }
 
@@ -282,52 +271,95 @@ static void draw_end(void)
 }
 
 /* ==========================================================================
- *  Ve Sprite voi Kenh Alpha (1-bit alpha thresholding)
+ *  Vẽ Sprite tang toc bang phan cung DMA2D
  * ========================================================================== */
-static void draw_sprite(int16_t x, int16_t y, uint16_t w, uint16_t h, const uint32_t *sprite_data)
+
+/* Vẽ Sprite co kenh Alpha (Tu dong Hoa tron phan cung) */
+static void draw_sprite_dma2d(int16_t x, int16_t y, uint16_t w, uint16_t h, const uint32_t *sprite_data)
 {
-    uint32_t *fb = (uint32_t *)((g_active_layer == 0) ? LCD_FB_LAYER0 : LCD_FB_LAYER1);
+    uint32_t fb_base = (g_active_layer == 0) ? LCD_FB_LAYER0 : LCD_FB_LAYER1;
 
-    for (uint16_t row = 0; row < h; row++) {
-        int16_t sy = y + row;
-        if (sy < 0 || sy >= (int16_t)SCR_H) continue;
+    int16_t src_x = 0;
+    int16_t src_y = 0;
+    int16_t draw_w = w;
+    int16_t draw_h = h;
 
-        for (uint16_t col = 0; col < w; col++) {
-            int16_t sx = x + col;
-            if (sx < 0 || sx >= (int16_t)SCR_W) continue;
+    // Cat bien ngang
+    if (x < 0) { src_x = -x; draw_w += x; x = 0; }
+    if (x + draw_w > (int16_t)SCR_W) draw_w = (int16_t)SCR_W - x;
 
-            uint32_t color = sprite_data[row * w + col];
-            if ((color & 0xFF000000) == 0) continue; // Bo qua pixel trong suot
+    // Cat bien doc
+    if (y < 0) { src_y = -y; draw_h += y; y = 0; }
+    if (y + draw_h > (int16_t)SCR_H) draw_h = (int16_t)SCR_H - y;
 
-            fb[sy * SCR_W + sx] = color;
-        }
-    }
+    if (draw_w <= 0 || draw_h <= 0) return;
+
+    uint32_t src_addr = (uint32_t)(sprite_data + src_y * w + src_x);
+    uint32_t dst_addr = (uint32_t)(fb_base + 4 * (y * SCR_W + x));
+
+    DMA2D_HandleTypeDef hdma2d = {0};
+    hdma2d.Instance = DMA2D;
+    hdma2d.Init.Mode = DMA2D_M2M_BLEND;
+    hdma2d.Init.ColorMode = DMA2D_OUTPUT_ARGB8888;
+    hdma2d.Init.OutputOffset = SCR_W - draw_w;
+
+    // Cau hinh Background (Layer 0) - Framebuffer
+    hdma2d.LayerCfg[0].AlphaMode = DMA2D_NO_MODIF_ALPHA;
+    hdma2d.LayerCfg[0].InputAlpha = 0xFF;
+    hdma2d.LayerCfg[0].InputColorMode = DMA2D_INPUT_ARGB8888;
+    hdma2d.LayerCfg[0].InputOffset = SCR_W - draw_w;
+
+    // Cau hinh Foreground (Layer 1) - Sprite co Alpha
+    hdma2d.LayerCfg[1].AlphaMode = DMA2D_REPLACE_ALPHA;
+    hdma2d.LayerCfg[1].InputAlpha = 0xFF;
+    hdma2d.LayerCfg[1].InputColorMode = DMA2D_INPUT_ARGB8888;
+    hdma2d.LayerCfg[1].InputOffset = w - draw_w;
+
+    HAL_DMA2D_Init(&hdma2d);
+    HAL_DMA2D_ConfigLayer(&hdma2d, 0);
+    HAL_DMA2D_ConfigLayer(&hdma2d, 1);
+
+    HAL_DMA2D_BlendingStart(&hdma2d, src_addr, dst_addr, dst_addr, draw_w, draw_h);
+    HAL_DMA2D_PollForTransfer(&hdma2d, 10);
 }
 
-/* Ve Sprite lật ngược chiều dọc (cho Ong phia tren) */
-static void draw_sprite_vflip(int16_t x, int16_t y, uint16_t w, uint16_t h, const uint32_t *sprite_data)
+/* Vẽ Sprite Opaque (Sao chep de truc tiep, khong hoa tron -> sieu nhanh) */
+static void draw_sprite_dma2d_opaque(int16_t x, int16_t y, uint16_t w, uint16_t h, const uint32_t *sprite_data)
 {
-    uint32_t *fb = (uint32_t *)((g_active_layer == 0) ? LCD_FB_LAYER0 : LCD_FB_LAYER1);
+    uint32_t fb_base = (g_active_layer == 0) ? LCD_FB_LAYER0 : LCD_FB_LAYER1;
 
-    for (uint16_t row = 0; row < h; row++) {
-        int16_t sy = y + row;
-        if (sy < 0 || sy >= (int16_t)SCR_H) continue;
+    int16_t src_x = 0;
+    int16_t src_y = 0;
+    int16_t draw_w = w;
+    int16_t draw_h = h;
 
-        uint16_t src_row = h - 1 - row; // Lay pixel tu duoi len cua sprite goc
+    if (x < 0) { src_x = -x; draw_w += x; x = 0; }
+    if (x + draw_w > (int16_t)SCR_W) draw_w = (int16_t)SCR_W - x;
+    if (y < 0) { src_y = -y; draw_h += y; y = 0; }
+    if (y + draw_h > (int16_t)SCR_H) draw_h = (int16_t)SCR_H - y;
 
-        for (uint16_t col = 0; col < w; col++) {
-            int16_t sx = x + col;
-            if (sx < 0 || sx >= (int16_t)SCR_W) continue;
+    if (draw_w <= 0 || draw_h <= 0) return;
 
-            uint32_t color = sprite_data[src_row * w + col];
-            if ((color & 0xFF000000) == 0) continue;
+    uint32_t src_addr = (uint32_t)(sprite_data + src_y * w + src_x);
+    uint32_t dst_addr = (uint32_t)(fb_base + 4 * (y * SCR_W + x));
 
-            fb[sy * SCR_W + sx] = color;
-        }
-    }
+    DMA2D_HandleTypeDef hdma2d = {0};
+    hdma2d.Instance = DMA2D;
+    hdma2d.Init.Mode = DMA2D_M2M;
+    hdma2d.Init.ColorMode = DMA2D_OUTPUT_ARGB8888;
+    hdma2d.Init.OutputOffset = SCR_W - draw_w;
+
+    hdma2d.LayerCfg[1].InputColorMode = DMA2D_INPUT_ARGB8888;
+    hdma2d.LayerCfg[1].InputOffset = w - draw_w;
+
+    HAL_DMA2D_Init(&hdma2d);
+    HAL_DMA2D_ConfigLayer(&hdma2d, 1);
+
+    HAL_DMA2D_Start(&hdma2d, src_addr, dst_addr, draw_w, draw_h);
+    HAL_DMA2D_PollForTransfer(&hdma2d, 10);
 }
 
-/* Ve chuoi chu voi nen trong suot (tranh lay o mau chu nhat chan text) */
+/* Ve chuoi chu voi nen trong suot bang CPU (keo font chu nhe) */
 static void draw_string_transparent(uint16_t x, uint16_t y, const char *str, sFONT *font, uint32_t text_color)
 {
     uint32_t *fb = (uint32_t *)((g_active_layer == 0) ? LCD_FB_LAYER0 : LCD_FB_LAYER1);
@@ -375,7 +407,7 @@ static void draw_string_transparent_centered(uint16_t y, const char *str, sFONT 
     draw_string_transparent(start_x, y, str, font, text_color);
 }
 
-/* Ve diem so su dung cac sprite so 0-9 dong */
+/* Ve diem so su dung cac sprite so 0-9 dong bang DMA2D */
 static void draw_score_sprites(uint32_t score, int16_t center_y)
 {
     char buf[16];
@@ -386,29 +418,67 @@ static void draw_score_sprites(uint32_t score, int16_t center_y)
         uint8_t digit = buf[i] - '0';
         total_width += sprite_number_widths[digit];
         if (i < len - 1) {
-            total_width += 2; // Khoang cach 2px giua cac chu so
+            total_width += 2;
         }
     }
 
     int16_t start_x = (SCR_W - total_width) / 2;
     for (int i = 0; i < len; i++) {
         uint8_t digit = buf[i] - '0';
-        draw_sprite(start_x, center_y, sprite_number_widths[digit], SPRITE_NUMBER_H, sprite_numbers[digit]);
+        draw_sprite_dma2d(start_x, center_y, sprite_number_widths[digit], SPRITE_NUMBER_H, sprite_numbers[digit]);
         start_x += sprite_number_widths[digit] + 2;
     }
 }
 
-/* Hoat anh lay sprite chim (vong lap 4 frame: 1 -> 2 -> 3 -> 2 -> ...) */
+/* Hoat anh lay sprite chim va xoay theo van toc doc g_bird_vy */
 static const uint32_t *get_bird_sprite(void)
 {
-    uint32_t index = (g_frame_count / 4) % 4;
-    switch (index) {
-        case 0: return sprite_bird1;
-        case 1: return sprite_bird2;
-        case 2: return sprite_bird3;
-        case 3: return sprite_bird2;
+    if (g_state == STATE_READY) {
+        uint32_t index = (g_frame_count / 4) % 4;
+        switch (index) {
+            case 0: return sprite_bird1;
+            case 1: return sprite_bird2;
+            case 2: return sprite_bird3;
+            case 3: return sprite_bird2;
+        }
+        return sprite_bird1;
     }
-    return sprite_bird1;
+
+    // Trang thai dang choi: Chon goc xoay theo van toc roi tu do g_bird_vy
+    if (g_bird_vy < -2.0f) {
+        // Ngoc dau len 30 do (Wing flapping anim)
+        uint32_t index = (g_frame_count / 3) % 4;
+        switch (index) {
+            case 0: return sprite_bird1_up;
+            case 1: return sprite_bird2_up;
+            case 2: return sprite_bird3_up;
+            case 3: return sprite_bird2_up;
+        }
+        return sprite_bird1_up;
+    }
+    else if (g_bird_vy < 1.5f) {
+        // Bay ngang (0 do)
+        uint32_t index = (g_frame_count / 4) % 4;
+        switch (index) {
+            case 0: return sprite_bird1;
+            case 1: return sprite_bird2;
+            case 2: return sprite_bird3;
+            case 3: return sprite_bird2;
+        }
+        return sprite_bird1;
+    }
+    else if (g_bird_vy < 3.5f) {
+        // Roi nghieng 30 do
+        return sprite_bird2_rot30;
+    }
+    else if (g_bird_vy < 5.5f) {
+        // Cam dau 60 do
+        return sprite_bird2_rot60;
+    }
+    else {
+        // Cam thang dung 90 do
+        return sprite_bird2_rot90;
+    }
 }
 
 /* ==========================================================================
@@ -434,7 +504,7 @@ static void update_playing(uint8_t flap)
 {
     if (flap) {
         g_bird_vy = FLAP_VELOCITY;
-        start_sound(SOUND_WING); // Phat am thanh chim bay khi vo canh
+        start_sound(SOUND_WING);
     }
 
     g_bird_vy += GRAVITY;
@@ -444,7 +514,7 @@ static void update_playing(uint8_t flap)
     /* Cham tran / cham dat -> thua */
     if (g_bird_y - BIRD_R < 0 || g_bird_y + BIRD_R > GROUND_Y) {
         g_state = STATE_GAMEOVER;
-        start_sound(SOUND_HIT_DIE); // Tieng va cham no lon
+        start_sound(SOUND_HIT_DIE);
         if (g_score > g_best) g_best = g_score;
         return;
     }
@@ -466,7 +536,7 @@ static void update_playing(uint8_t flap)
         if (!g_pipes[i].scored && g_pipes[i].x + PIPE_W < BIRD_X - BIRD_R) {
             g_pipes[i].scored = 1;
             g_score++;
-            start_sound(SOUND_POINT); // Phat tieng bip an diem
+            start_sound(SOUND_POINT);
         }
 
         /* Va cham voi ong: chim chong len vung ong theo truc X */
@@ -477,7 +547,7 @@ static void update_playing(uint8_t flap)
             if (g_bird_y - BIRD_R < gap_top ||
                 g_bird_y + BIRD_R > gap_bottom) {
                 g_state = STATE_GAMEOVER;
-                start_sound(SOUND_HIT_DIE); // Tieng va cham
+                start_sound(SOUND_HIT_DIE);
                 if (g_score > g_best) g_best = g_score;
                 return;
             }
@@ -493,15 +563,16 @@ static void draw_pipe(const Pipe *p)
     int16_t gap_top    = p->gap_y - GAP_H / 2;
     int16_t gap_bottom = p->gap_y + GAP_H / 2;
 
-    /* Ve Ong tren (Lay pixel tu duoi len) */
+    /* Ve Ong tren (Truy cap phan cuoi cua mang anh ong nuoc lat nguoc stm32f4xx_hal_tim) */
     if (gap_top > 0) {
-        draw_sprite_vflip(p->x, 0, SPRITE_PIPE_W, gap_top, sprite_pipe);
+        const uint32_t *sprite_src = sprite_pipe_flipped + (320 - gap_top) * SPRITE_PIPE_W;
+        draw_sprite_dma2d(p->x, 0, SPRITE_PIPE_W, gap_top, sprite_src);
     }
 
-    /* Ve Ong duoi (Lay dung chieu tu tren xuong) */
+    /* Ve Ong duoi (Lay dung tu dau tro xuong) */
     int16_t bottom_pipe_h = GROUND_Y - gap_bottom;
     if (bottom_pipe_h > 0) {
-        draw_sprite(p->x, gap_bottom, SPRITE_PIPE_W, bottom_pipe_h, sprite_pipe);
+        draw_sprite_dma2d(p->x, gap_bottom, SPRITE_PIPE_W, bottom_pipe_h, sprite_pipe);
     }
 }
 
@@ -509,8 +580,8 @@ static void draw_frame(void)
 {
     draw_begin();
 
-    // 1. Ve anh nen (Clear luon)
-    draw_sprite(0, 0, SPRITE_BG_W, SPRITE_BG_H, sprite_background);
+    // 1. Ve anh nen (Khong can blending -> dma2d_opaque cuc ky nhanh)
+    draw_sprite_dma2d_opaque(0, 0, SPRITE_BG_W, SPRITE_BG_H, sprite_background);
 
     // 2. Ve cac cot (chi khi dang choi hoac game over)
     if (g_state == STATE_PLAYING || g_state == STATE_GAMEOVER) {
@@ -519,32 +590,28 @@ static void draw_frame(void)
         }
     }
 
-    // 3. Ve mat dat (cuon ngang)
-    draw_sprite(-g_ground_scroll, GROUND_Y, SPRITE_GROUND_W, SPRITE_GROUND_H, sprite_ground);
+    // 3. Ve mat dat (opaque copy ho tro am)
+    draw_sprite_dma2d_opaque(-g_ground_scroll, GROUND_Y, SPRITE_GROUND_W, SPRITE_GROUND_H, sprite_ground);
 
-    // 4. Ve chim (hoat anh bay)
+    // 4. Ve chim (36x36 dong nhat, xoay theo van toc, hoa tron alpha)
     int16_t bx = BIRD_X - SPRITE_BIRD_W / 2;
     int16_t by = (int16_t)g_bird_y - SPRITE_BIRD_H / 2;
-    draw_sprite(bx, by, SPRITE_BIRD_W, SPRITE_BIRD_H, get_bird_sprite());
+    draw_sprite_dma2d(bx, by, SPRITE_BIRD_W, SPRITE_BIRD_H, get_bird_sprite());
 
     // 5. Ve giao dien theo tung trang thai
     if (g_state == STATE_READY) {
-        // Ve panel bat dau (message.png) giua troi
         int16_t mx = (SCR_W - SPRITE_MESSAGE_W) / 2;
         int16_t my = (GROUND_Y - SPRITE_MESSAGE_H) / 2;
         if (my < 0) my = 2;
-        draw_sprite(mx, my, SPRITE_MESSAGE_W, SPRITE_MESSAGE_H, sprite_message);
+        draw_sprite_dma2d(mx, my, SPRITE_MESSAGE_W, SPRITE_MESSAGE_H, sprite_message);
     }
     else if (g_state == STATE_PLAYING) {
-        // Ve diem so lon bang anh so
         draw_score_sprites(g_score, 20);
     }
     else if (g_state == STATE_GAMEOVER) {
-        // Ve chu GAME OVER bang sprite
         int16_t go_x = (SCR_W - SPRITE_GAMEOVER_W) / 2;
-        draw_sprite(go_x, 45, SPRITE_GAMEOVER_W, SPRITE_GAMEOVER_H, sprite_gameover);
+        draw_sprite_dma2d(go_x, 45, SPRITE_GAMEOVER_W, SPRITE_GAMEOVER_H, sprite_gameover);
 
-        // Ve bang diem chu de thuong trong suot
         draw_string_transparent_centered(105, "SCORE", &Font16, COL_TEXT);
         draw_score_sprites(g_score, 125);
 

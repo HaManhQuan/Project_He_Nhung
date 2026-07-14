@@ -15,21 +15,24 @@ extern const uint32_t sprite_background[76800];
 #define SPRITE_GROUND_H 48
 extern const uint32_t sprite_ground[16128];
 
-#define SPRITE_BIRD_W 34
-#define SPRITE_BIRD_H 24
-extern const uint32_t sprite_bird1[816];
+#define SPRITE_BIRD_W 36
+#define SPRITE_BIRD_H 36
+extern const uint32_t sprite_bird1[1296];
+extern const uint32_t sprite_bird2[1296];
+extern const uint32_t sprite_bird3[1296];
 
-#define SPRITE_BIRD_W 34
-#define SPRITE_BIRD_H 24
-extern const uint32_t sprite_bird2[816];
+extern const uint32_t sprite_bird1_up[1296];
+extern const uint32_t sprite_bird2_up[1296];
+extern const uint32_t sprite_bird3_up[1296];
 
-#define SPRITE_BIRD_W 34
-#define SPRITE_BIRD_H 24
-extern const uint32_t sprite_bird3[816];
+extern const uint32_t sprite_bird2_rot30[1296];
+extern const uint32_t sprite_bird2_rot60[1296];
+extern const uint32_t sprite_bird2_rot90[1296];
 
 #define SPRITE_PIPE_W 52
 #define SPRITE_PIPE_H 320
 extern const uint32_t sprite_pipe[16640];
+extern const uint32_t sprite_pipe_flipped[16640];
 
 #define SPRITE_GAMEOVER_W 192
 #define SPRITE_GAMEOVER_H 42
