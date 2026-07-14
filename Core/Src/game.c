@@ -1,12 +1,14 @@
 /**
  * *****************************************************************************
  * @file    game.c
- * @brief   Flappy Bird cho STM32F429I-DISC1 (Phien ban tang toc DMA2D + Xoay chim)
+ * @brief   Flappy Bird cho STM32F429I-DISC1 (Toi uu VSYNC + Am thanh + Rung + Do kho)
  *
  *  - Man hinh: TFT 240x320 tich hop tren board (dieu khien qua BSP_LCD_*)
  *  - Dieu khien: nut USER (B1) PA0 hoac cham vao bat ky dau tren man hinh cam ung
- *  - Do hoa: Tang toc phan cung DMA2D (Chrom-Art) de ve nen, mat dat, chim va cot
- *  - Am thanh: Ngat Timer 4 dieu tan coi chip PC9 va nhay LED PG14
+ *  - Do hoa: Tang toc phan cung DMA2D (Chrom-Art)
+ *  - Rung & Chop: Rung man hinh va chop trang khi chim va cham chet
+ *  - Do kho: Tang toc ong va thu hep khe ho theo diem so
+ *  - Nền dem: Tu dong chuyen sang man dem (background_night) khi dat 15 diem
  * *****************************************************************************
  */
 #include "game.h"
@@ -19,6 +21,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 
 /* ==========================================================================
  *  Cau hinh man hinh & double buffer
@@ -32,7 +35,7 @@
 #define LCD_FB_LAYER1    ((uint32_t)(0xD0000000 + (SCR_W * SCR_H * 4u)))
 
 /* ==========================================================================
- *  Tham so game (chinh o day de tang/giam do kho)
+ *  Tham so game va cau hinh dong
  * ========================================================================== */
 #define BIRD_X           60      /* vi tri ngang co dinh cua chim            */
 #define BIRD_R           9       /* ban kinh va cham vat ly cua chim (pixel)  */
@@ -42,8 +45,6 @@
 #define MAX_FALL         8.0f    /* gioi han van toc roi                     */
 
 #define PIPE_W           52      /* be rong ong (trung hop voi SPRITE_PIPE_W) */
-#define GAP_H            96      /* do cao khe ho de chim chui qua           */
-#define PIPE_SPEED       3       /* toc do ong chay sang trai (pixel/khung)  */
 #define PIPE_SPACING     150     /* khoang cach giua 2 ong lien tiep         */
 #define NUM_PIPES        3       /* so ong quan ly cung lu                   */
 
@@ -78,8 +79,14 @@ static uint32_t  g_score;
 static uint32_t  g_best;
 
 static volatile uint32_t g_active_layer; /* layer dang dung de VE (0 hoac 1) */
-static int16_t           g_ground_scroll; /* do cuon cua mat dat (0 den 95) */
+static int16_t           g_ground_scroll; /* do cuon cua mat dat */
 static uint32_t          g_frame_count;   /* dung de chay hoat anh canh chim */
+
+/* Hieu ung Rung man hinh (Screen Shake) va Chop sang (Flash) */
+static int16_t           g_shake_x = 0;
+static int16_t           g_shake_y = 0;
+static uint8_t           g_shake_frames = 0;
+static uint8_t           g_flash_frames = 0;
 
 /* ==========================================================================
  *  Cau hinh Am thanh bang Timer 4 & GPIO PC9
@@ -124,7 +131,7 @@ static void Buzzer_Init(void)
     htim4.Instance = TIM4;
     htim4.Init.Prescaler = 90 - 1;
     htim4.Init.CounterMode = TIM_COUNTERMODE_UP;
-    htim4.Init.Period = 1000 - 1; // Mac dinh ngat o 1 kHz
+    htim4.Init.Period = 1000 - 1;
     htim4.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
     HAL_TIM_Base_Init(&htim4);
 
@@ -136,7 +143,6 @@ static void Buzzer_Init(void)
 static void play_frequency(uint16_t freq)
 {
     if (freq == 0) {
-        // Tat am thanh
         HAL_TIM_Base_Stop_IT(&htim4);
         HAL_GPIO_WritePin(GPIOC, GPIO_PIN_9, GPIO_PIN_RESET);
         HAL_GPIO_WritePin(GPIOG, GPIO_PIN_14, GPIO_PIN_RESET);
@@ -225,6 +231,24 @@ static uint32_t rng_next(void)
 }
 
 /* ==========================================================================
+ *  Quan ly do kho dong (Dynamic Difficulty)
+ * ========================================================================== */
+static uint8_t get_pipe_speed(void)
+{
+    if (g_state != STATE_PLAYING) return 3; // Toc do mac dinh o menu
+    if (g_score < 10) return 3;
+    if (g_score < 25) return 4;
+    return 5; // Diem cao chay nhanh hon
+}
+
+static uint8_t get_gap_height(void)
+{
+    if (g_score < 10) return 96;
+    if (g_score < 20) return 86;
+    return 76; // Càng nhieu diem khe ho cang hep
+}
+
+/* ==========================================================================
  *  Doc nut bam va cam ung: Phat hien suon len (chi flap 1 lan/lan cham)
  * ========================================================================== */
 static uint8_t g_btn_prev = 0;
@@ -260,13 +284,8 @@ static void draw_end(void)
 {
     uint32_t back_fb = (g_active_layer == 0) ? LCD_FB_LAYER0 : LCD_FB_LAYER1;
 
-    // Chi doi dia chi của Layer 0 sang buffer vua ve xong
     BSP_LCD_SetLayerAddress(0, back_fb);
-
-    // Kich hoat dong bo hoa cap nhat tren VSYNC de chong nhay
     BSP_LCD_Relaod(LCD_RELOAD_VERTICAL_BLANKING);
-
-    // Hoan doi layer hoat dong cho frame tiep theo
     g_active_layer = 1u - g_active_layer;
 }
 
@@ -284,11 +303,8 @@ static void draw_sprite_dma2d(int16_t x, int16_t y, uint16_t w, uint16_t h, cons
     int16_t draw_w = w;
     int16_t draw_h = h;
 
-    // Cat bien ngang
     if (x < 0) { src_x = -x; draw_w += x; x = 0; }
     if (x + draw_w > (int16_t)SCR_W) draw_w = (int16_t)SCR_W - x;
-
-    // Cat bien doc
     if (y < 0) { src_y = -y; draw_h += y; y = 0; }
     if (y + draw_h > (int16_t)SCR_H) draw_h = (int16_t)SCR_H - y;
 
@@ -303,14 +319,14 @@ static void draw_sprite_dma2d(int16_t x, int16_t y, uint16_t w, uint16_t h, cons
     hdma2d.Init.ColorMode = DMA2D_OUTPUT_ARGB8888;
     hdma2d.Init.OutputOffset = SCR_W - draw_w;
 
-    // Cau hinh Background (Layer 0) - Framebuffer
+    // Background (Layer 0) - Framebuffer
     hdma2d.LayerCfg[0].AlphaMode = DMA2D_NO_MODIF_ALPHA;
     hdma2d.LayerCfg[0].InputAlpha = 0xFF;
     hdma2d.LayerCfg[0].InputColorMode = DMA2D_INPUT_ARGB8888;
     hdma2d.LayerCfg[0].InputOffset = SCR_W - draw_w;
 
-    // Cau hinh Foreground (Layer 1) - Sprite co Alpha
-    hdma2d.LayerCfg[1].AlphaMode = DMA2D_REPLACE_ALPHA;
+    // Foreground (Layer 1) - Sprite giu nguyen Alpha
+    hdma2d.LayerCfg[1].AlphaMode = DMA2D_NO_MODIF_ALPHA;
     hdma2d.LayerCfg[1].InputAlpha = 0xFF;
     hdma2d.LayerCfg[1].InputColorMode = DMA2D_INPUT_ARGB8888;
     hdma2d.LayerCfg[1].InputOffset = w - draw_w;
@@ -359,7 +375,7 @@ static void draw_sprite_dma2d_opaque(int16_t x, int16_t y, uint16_t w, uint16_t 
     HAL_DMA2D_PollForTransfer(&hdma2d, 10);
 }
 
-/* Ve chuoi chu voi nen trong suot bang CPU (keo font chu nhe) */
+/* Ve chuoi chu voi nen trong suot bang CPU */
 static void draw_string_transparent(uint16_t x, uint16_t y, const char *str, sFONT *font, uint32_t text_color)
 {
     uint32_t *fb = (uint32_t *)((g_active_layer == 0) ? LCD_FB_LAYER0 : LCD_FB_LAYER1);
@@ -425,7 +441,7 @@ static void draw_score_sprites(uint32_t score, int16_t center_y)
     int16_t start_x = (SCR_W - total_width) / 2;
     for (int i = 0; i < len; i++) {
         uint8_t digit = buf[i] - '0';
-        draw_sprite_dma2d(start_x, center_y, sprite_number_widths[digit], SPRITE_NUMBER_H, sprite_numbers[digit]);
+        draw_sprite_dma2d(start_x + g_shake_x, center_y + g_shake_y, sprite_number_widths[digit], SPRITE_NUMBER_H, sprite_numbers[digit]);
         start_x += sprite_number_widths[digit] + 2;
     }
 }
@@ -444,9 +460,7 @@ static const uint32_t *get_bird_sprite(void)
         return sprite_bird1;
     }
 
-    // Trang thai dang choi: Chon goc xoay theo van toc roi tu do g_bird_vy
     if (g_bird_vy < -2.0f) {
-        // Ngoc dau len 30 do (Wing flapping anim)
         uint32_t index = (g_frame_count / 3) % 4;
         switch (index) {
             case 0: return sprite_bird1_up;
@@ -457,7 +471,6 @@ static const uint32_t *get_bird_sprite(void)
         return sprite_bird1_up;
     }
     else if (g_bird_vy < 1.5f) {
-        // Bay ngang (0 do)
         uint32_t index = (g_frame_count / 4) % 4;
         switch (index) {
             case 0: return sprite_bird1;
@@ -468,15 +481,12 @@ static const uint32_t *get_bird_sprite(void)
         return sprite_bird1;
     }
     else if (g_bird_vy < 3.5f) {
-        // Roi nghieng 30 do
         return sprite_bird2_rot30;
     }
     else if (g_bird_vy < 5.5f) {
-        // Cam dau 60 do
         return sprite_bird2_rot60;
     }
     else {
-        // Cam thang dung 90 do
         return sprite_bird2_rot90;
     }
 }
@@ -495,6 +505,10 @@ static void reset_round(void)
         g_pipes[i].gap_y = GAP_MIN_Y + rng_next() % (GAP_MAX_Y - GAP_MIN_Y);
         g_pipes[i].scored = 0;
     }
+    g_shake_x = 0;
+    g_shake_y = 0;
+    g_shake_frames = 0;
+    g_flash_frames = 0;
 }
 
 /* ==========================================================================
@@ -515,12 +529,14 @@ static void update_playing(uint8_t flap)
     if (g_bird_y - BIRD_R < 0 || g_bird_y + BIRD_R > GROUND_Y) {
         g_state = STATE_GAMEOVER;
         start_sound(SOUND_HIT_DIE);
+        g_shake_frames = 12; // Kich hoat rung man hinh
+        g_flash_frames = 2;  // Kich hoat chop trang
         if (g_score > g_best) g_best = g_score;
         return;
     }
 
     for (int i = 0; i < NUM_PIPES; i++) {
-        g_pipes[i].x -= PIPE_SPEED;
+        g_pipes[i].x -= get_pipe_speed();
 
         /* Ong chay het man -> dua ra sau va sinh khe moi */
         if (g_pipes[i].x + PIPE_W < 0) {
@@ -542,12 +558,14 @@ static void update_playing(uint8_t flap)
         /* Va cham voi ong: chim chong len vung ong theo truc X */
         if (BIRD_X + BIRD_R > g_pipes[i].x &&
             BIRD_X - BIRD_R < g_pipes[i].x + PIPE_W) {
-            int16_t gap_top    = g_pipes[i].gap_y - GAP_H / 2;
-            int16_t gap_bottom = g_pipes[i].gap_y + GAP_H / 2;
+            int16_t gap_top    = g_pipes[i].gap_y - get_gap_height() / 2;
+            int16_t gap_bottom = g_pipes[i].gap_y + get_gap_height() / 2;
             if (g_bird_y - BIRD_R < gap_top ||
                 g_bird_y + BIRD_R > gap_bottom) {
                 g_state = STATE_GAMEOVER;
                 start_sound(SOUND_HIT_DIE);
+                g_shake_frames = 12; // Kich hoat rung man hinh
+                g_flash_frames = 2;  // Kich hoat chop trang
                 if (g_score > g_best) g_best = g_score;
                 return;
             }
@@ -560,19 +578,19 @@ static void update_playing(uint8_t flap)
  * ========================================================================== */
 static void draw_pipe(const Pipe *p)
 {
-    int16_t gap_top    = p->gap_y - GAP_H / 2;
-    int16_t gap_bottom = p->gap_y + GAP_H / 2;
+    int16_t gap_top    = p->gap_y - get_gap_height() / 2;
+    int16_t gap_bottom = p->gap_y + get_gap_height() / 2;
 
     /* Ve Ong tren (Truy cap phan cuoi cua mang anh ong nuoc lat nguoc stm32f4xx_hal_tim) */
     if (gap_top > 0) {
         const uint32_t *sprite_src = sprite_pipe_flipped + (320 - gap_top) * SPRITE_PIPE_W;
-        draw_sprite_dma2d(p->x, 0, SPRITE_PIPE_W, gap_top, sprite_src);
+        draw_sprite_dma2d(p->x + g_shake_x, g_shake_y, SPRITE_PIPE_W, gap_top, sprite_src);
     }
 
     /* Ve Ong duoi (Lay dung tu dau tro xuong) */
     int16_t bottom_pipe_h = GROUND_Y - gap_bottom;
     if (bottom_pipe_h > 0) {
-        draw_sprite_dma2d(p->x, gap_bottom, SPRITE_PIPE_W, bottom_pipe_h, sprite_pipe);
+        draw_sprite_dma2d(p->x + g_shake_x, gap_bottom + g_shake_y, SPRITE_PIPE_W, bottom_pipe_h, sprite_pipe);
     }
 }
 
@@ -580,45 +598,68 @@ static void draw_frame(void)
 {
     draw_begin();
 
-    // 1. Ve anh nen (Khong can blending -> dma2d_opaque cuc ky nhanh)
-    draw_sprite_dma2d_opaque(0, 0, SPRITE_BG_W, SPRITE_BG_H, sprite_background);
+    // 1. Kiem tra hieu ung chop trang (Flash)
+    if (g_flash_frames > 0) {
+        uint32_t fb_base = (g_active_layer == 0) ? LCD_FB_LAYER0 : LCD_FB_LAYER1;
+        memset((void*)fb_base, 0xFF, SCR_W * SCR_H * 4); // Phủ trang toan bo man hinh
+        g_flash_frames--;
+        draw_end();
+        return;
+    }
 
-    // 2. Ve cac cot (chi khi dang choi hoac game over)
+    // 2. Kiem tra hieu ung rung man hinh (Shake)
+    if (g_shake_frames > 0) {
+        g_shake_x = ((int16_t)(rng_next() % 9)) - 4; // Rung ngang tu -4 den 4 pixel
+        g_shake_y = ((int16_t)(rng_next() % 9)) - 4; // Rung doc tu -4 den 4 pixel
+        g_shake_frames--;
+    } else {
+        g_shake_x = 0;
+        g_shake_y = 0;
+    }
+
+    // 3. Ve anh nen (Chuyen sang man dem sprite_background_night khi >= 15 diem)
+    if (g_score < 15) {
+        draw_sprite_dma2d_opaque(g_shake_x, g_shake_y, SPRITE_BG_W, SPRITE_BG_H, sprite_background);
+    } else {
+        draw_sprite_dma2d_opaque(g_shake_x, g_shake_y, SPRITE_BG_W, SPRITE_BG_H, sprite_background_night);
+    }
+
+    // 4. Ve cac cot
     if (g_state == STATE_PLAYING || g_state == STATE_GAMEOVER) {
         for (int i = 0; i < NUM_PIPES; i++) {
             draw_pipe(&g_pipes[i]);
         }
     }
 
-    // 3. Ve mat dat (opaque copy ho tro am)
-    draw_sprite_dma2d_opaque(-g_ground_scroll, GROUND_Y, SPRITE_GROUND_W, SPRITE_GROUND_H, sprite_ground);
+    // 5. Ve mat dat (opaque copy ho tro am)
+    draw_sprite_dma2d_opaque(-g_ground_scroll + g_shake_x, GROUND_Y + g_shake_y, SPRITE_GROUND_W, SPRITE_GROUND_H, sprite_ground);
 
-    // 4. Ve chim (36x36 dong nhat, xoay theo van toc, hoa tron alpha)
+    // 6. Ve chim (36x36 dong nhat, xoay theo van toc)
     int16_t bx = BIRD_X - SPRITE_BIRD_W / 2;
     int16_t by = (int16_t)g_bird_y - SPRITE_BIRD_H / 2;
-    draw_sprite_dma2d(bx, by, SPRITE_BIRD_W, SPRITE_BIRD_H, get_bird_sprite());
+    draw_sprite_dma2d(bx + g_shake_x, by + g_shake_y, SPRITE_BIRD_W, SPRITE_BIRD_H, get_bird_sprite());
 
-    // 5. Ve giao dien theo tung trang thai
+    // 7. Ve giao dien theo tung trang thai
     if (g_state == STATE_READY) {
         int16_t mx = (SCR_W - SPRITE_MESSAGE_W) / 2;
         int16_t my = (GROUND_Y - SPRITE_MESSAGE_H) / 2;
         if (my < 0) my = 2;
-        draw_sprite_dma2d(mx, my, SPRITE_MESSAGE_W, SPRITE_MESSAGE_H, sprite_message);
+        draw_sprite_dma2d(mx + g_shake_x, my + g_shake_y, SPRITE_MESSAGE_W, SPRITE_MESSAGE_H, sprite_message);
     }
     else if (g_state == STATE_PLAYING) {
         draw_score_sprites(g_score, 20);
     }
     else if (g_state == STATE_GAMEOVER) {
         int16_t go_x = (SCR_W - SPRITE_GAMEOVER_W) / 2;
-        draw_sprite_dma2d(go_x, 45, SPRITE_GAMEOVER_W, SPRITE_GAMEOVER_H, sprite_gameover);
+        draw_sprite_dma2d(go_x + g_shake_x, 45 + g_shake_y, SPRITE_GAMEOVER_W, SPRITE_GAMEOVER_H, sprite_gameover);
 
-        draw_string_transparent_centered(105, "SCORE", &Font16, COL_TEXT);
+        draw_string_transparent(100 + g_shake_x, 105 + g_shake_y, "SCORE", &Font16, COL_TEXT);
         draw_score_sprites(g_score, 125);
 
-        draw_string_transparent_centered(170, "BEST", &Font16, COL_TEXT);
+        draw_string_transparent(105 + g_shake_x, 170 + g_shake_y, "BEST", &Font16, COL_TEXT);
         draw_score_sprites(g_best, 190);
 
-        draw_string_transparent_centered(245, "TAP TO PLAY AGAIN", &Font16, COL_TEXT);
+        draw_string_transparent_centered(245 + g_shake_y, "TAP TO PLAY AGAIN", &Font16, COL_TEXT);
     }
 
     draw_end();
@@ -702,7 +743,9 @@ void Game_Loop(void)
 
         // Mat dat dung cuon khi game over
         if (g_state != STATE_GAMEOVER) {
-            g_ground_scroll = (g_ground_scroll + PIPE_SPEED) % 96; // 336 - 240 = 96
+            // Cuon dong bo voi toc do ong nuoc get_pipe_speed()
+            // Tối ưu hóa chu kỳ cuộn mat dat o 60 pixel de luon chia het cho toc do 3, 4, 5 (khong lech nét)
+            g_ground_scroll = (g_ground_scroll + get_pipe_speed()) % 60;
         }
         g_frame_count++;
 

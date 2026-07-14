@@ -10,6 +10,7 @@ extern "C" {
 #define SPRITE_BG_W 240
 #define SPRITE_BG_H 320
 extern const uint32_t sprite_background[76800];
+extern const uint32_t sprite_background_night[76800];
 
 #define SPRITE_GROUND_W 336
 #define SPRITE_GROUND_H 48
